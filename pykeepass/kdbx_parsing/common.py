@@ -3,20 +3,26 @@ from .twofish import Twofish
 from Crypto.Util import Padding as CryptoPadding
 import hashlib
 from construct import (
-    Adapter, BitStruct, BitsSwapped, Container, Flag, Padding, RepeatUntil,
-    Subconstruct, Construct, ListContainer, Mapping, GreedyBytes, Int32ul,
-    Switch
+    Adapter, BitStruct, BitsSwapped, Container, Flag, Padding, ListContainer, Mapping, GreedyBytes, Int32ul, Switch
 )
 from lxml import etree
 import base64
+import unicodedata
 import zlib
+import re
+import codecs
 from io import BytesIO
 from collections import OrderedDict
 
+
 class HeaderChecksumError(Exception):
     pass
+
+
 class CredentialsError(Exception):
     pass
+
+
 class PayloadChecksumError(Exception):
     pass
 
@@ -24,20 +30,41 @@ class PayloadChecksumError(Exception):
 class DynamicDict(Adapter):
     """ListContainer <---> Container
     Convenience mapping so we dont have to iterate ListContainer to find
-    the right item"""
+    the right item
 
-    def __init__(self, key, subcon):
+    FIXME: lump kwarg was added to get around the fact that InnerHeader is
+    not truly a dict.  We lump all 'binary' InnerHeaderItems into a single list
+    """
+
+    def __init__(self, key, subcon, lump=[]):
         super(DynamicDict, self).__init__(subcon)
         self.key = key
+        self.lump = lump
 
     # map ListContainer to Container
     def _decode(self, obj, context, path):
-        d = OrderedDict((item[self.key], item) for item in obj)
+        d = OrderedDict()
+        for l in self.lump:
+            d[l] = ListContainer([])
+        for item in obj:
+            if item[self.key] in self.lump:
+                d[item[self.key]].append(item)
+            else:
+                d[item[self.key]] = item
+
         return Container(d)
 
     # map Container to ListContainer
     def _encode(self, obj, context, path):
-        return ListContainer(obj.values())
+        l = []
+        for key in obj:
+            if key in self.lump:
+                l += obj[key]
+            else:
+                l.append(obj[key])
+
+        return ListContainer(l)
+
 
 def Reparsed(subcon_out):
     class Reparsed(Adapter):
@@ -52,21 +79,18 @@ def Reparsed(subcon_out):
 
     return Reparsed
 
+
 # is the payload compressed?
 CompressionFlags = BitsSwapped(
     BitStruct("compression" / Flag, Padding(8 * 4 - 1))
 )
 
-# -------------------- Key Computation --------------------
 
-def aes_kdf(key, rounds, password=None, keyfile=None):
+# -------------------- Key Computation --------------------
+def aes_kdf(key, rounds, key_composite):
     """Set up a context for AES128-ECB encryption to find transformed_key"""
 
     cipher = AES.new(key, AES.MODE_ECB)
-    key_composite = compute_key_composite(
-        password=password,
-        keyfile=keyfile
-    )
 
     # get the number of rounds from the header and transform the key_composite
     transformed_key = key_composite
@@ -97,14 +121,21 @@ def compute_key_composite(password=None, keyfile=None):
             try:
                 with open(keyfile, 'rb') as f:
                     key = f.read()
+
+                    try:
+                        int(key, 16)
+                        is_hex = True
+                    except ValueError:
+                        is_hex = False
                     # if the length is 32 bytes we assume it is the key
                     if len(key) == 32:
                         keyfile_composite = key
                     # if the length is 64 bytes we assume the key is hex encoded
-                    if len(key) == 64:
-                        keyfile_composite =  key.decode('hex')
+                    elif len(key) == 64 and is_hex:
+                        keyfile_composite = codecs.decode(key, 'hex')
                     # anything else may be a file to hash for the key
-                    keyfile_composite = hashlib.sha256(key).digest()
+                    else:
+                        keyfile_composite = hashlib.sha256(key).digest()
             except:
                 raise IOError('Could not read keyfile')
 
@@ -113,6 +144,7 @@ def compute_key_composite(password=None, keyfile=None):
 
     # create composite key from password and keyfile composites
     return hashlib.sha256(password_composite + keyfile_composite).digest()
+
 
 def compute_master(context):
     """Computes master key from transformed key and master seed.
@@ -137,6 +169,7 @@ class XML(Adapter):
     def _encode(self, tree, con, path):
         return etree.tostring(tree)
 
+
 class UnprotectedStream(Adapter):
     """lxml etree <---> unprotected lxml etree
     Iterate etree for Protected elements and decrypt using cipher
@@ -153,11 +186,14 @@ class UnprotectedStream(Adapter):
         cipher = self.get_cipher(self.protected_stream_key(con))
         for elem in tree.xpath(self.protected_xpath):
             if elem.text is not None:
-                elem.text = cipher.decrypt(
-                    base64.b64decode(
-                        elem.text
-                    )
-                ).decode('utf-8')
+                result = cipher.decrypt(base64.b64decode(elem.text)).decode('utf-8')
+                # strip invalid XML characters - https://stackoverflow.com/questions/8733233
+                result = re.sub(
+                    u'[^\u0020-\uD7FF\u0009\u000A\u000D\uE000-\uFFFD\U00010000-\U0010FFFF]+',
+                    '',
+                    result
+                )
+                elem.text = result
             elem.attrib['Protected'] = 'False'
         return tree
 
@@ -178,6 +214,7 @@ class ARCFourVariantStream(UnprotectedStream):
     def get_cipher(self, protected_stream_key):
         raise Exception("ARCFourVariant not implemented")
 
+
 # https://github.com/dlech/KeePass2.x/blob/97141c02733cd3abf8d4dce1187fa7959ded58a8/KeePassLib/Cryptography/CryptoRandomStream.cs#L115-L119
 class Salsa20Stream(UnprotectedStream):
     def get_cipher(self, protected_stream_key):
@@ -186,6 +223,7 @@ class Salsa20Stream(UnprotectedStream):
             key=key,
             nonce=b'\xE8\x30\x09\x4B\x97\x20\x5D\x2A'
         )
+
 
 # https://github.com/dlech/KeePass2.x/blob/97141c02733cd3abf8d4dce1187fa7959ded58a8/KeePassLib/Cryptography/CryptoRandomStream.cs#L103-L111
 class ChaCha20Stream(UnprotectedStream):
@@ -207,7 +245,7 @@ def Unprotect(protected_stream_id, protected_stream_key, subcon):
         {'arcfourvariant': ARCFourVariantStream(protected_stream_key, subcon),
          'salsa20': Salsa20Stream(protected_stream_key, subcon),
          'chacha20': ChaCha20Stream(protected_stream_key, subcon),
-        },
+         },
         default=subcon
     )
 
@@ -231,6 +269,7 @@ class Concatenated(Adapter):
 
         return blocks
 
+
 class DecryptedPayload(Adapter):
     """Encrypted Bytes <---> Decrypted Bytes"""
 
@@ -253,13 +292,16 @@ class DecryptedPayload(Adapter):
 
         return payload_data
 
+
 class AES256Payload(DecryptedPayload):
     def get_cipher(self, master_key, encryption_iv):
         return AES.new(master_key, AES.MODE_CBC, encryption_iv)
 
+
 class ChaCha20Payload(DecryptedPayload):
     def get_cipher(self, master_key, encryption_iv):
         return ChaCha20.new(key=master_key, nonce=encryption_iv)
+
 
 class TwoFishPayload(DecryptedPayload):
     def get_cipher(self, master_key, encryption_iv):
@@ -285,7 +327,6 @@ class Decompressed(Adapter):
         return data
 
 
-
 # -------------------- Cipher Enums --------------------
 
 # payload encryption method
@@ -295,7 +336,7 @@ CipherId = Mapping(
     {'aes256': b'1\xc1\xf2\xe6\xbfqCP\xbeX\x05!j\xfcZ\xff',
      'twofish': b'\xadh\xf2\x9fWoK\xb9\xa3j\xd4z\xf9e4l',
      'chacha20': b'\xd6\x03\x8a+\x8boL\xb5\xa5$3\x9a1\xdb\xb5\x9a'
-    }
+     }
 )
 
 # protected entry encryption method
@@ -306,5 +347,5 @@ ProtectedStreamId = Mapping(
      'arcfourvariant': 1,
      'salsa20': 2,
      'chacha20': 3,
-    }
+     }
 )

@@ -1,46 +1,71 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-from __future__ import print_function
-from __future__ import unicode_literals
-from __future__ import absolute_import
+# FIXME python2
+from __future__ import absolute_import, print_function, unicode_literals
+from future.utils import python_2_unicode_compatible
+
 import base64
 import logging
 import os
 import re
-from uuid import UUID
-from io import BytesIO
+import uuid
+import zlib
+
+from construct import Container, ChecksumError
+from lxml import etree
+from lxml.builder import E
+
+from pykeepass.attachment import Attachment
+from pykeepass.entry import Entry
+from pykeepass.exceptions import *
+from pykeepass.group import Group
 from pykeepass.kdbx_parsing.kdbx import KDBX
 from pykeepass.kdbx_parsing.kdbx4 import kdf_uuids
-from lxml import etree
+from pykeepass.xpath import attachment_xp, entry_xp, group_xp, path_xp
 
-from pykeepass.entry import Entry
-from pykeepass.group import Group
-
+logging.basicConfig()
 logger = logging.getLogger(__name__)
 
-
+# FIXME python2
+@python_2_unicode_compatible
 class PyKeePass(object):
 
-    def __init__(self, filename, password=None, keyfile=None):
+    def __init__(self, filename, password=None, keyfile=None,
+                 transformed_key=None):
         self.filename = filename
 
-        self.read(password=password, keyfile=keyfile)
+        self.read(
+            password=password,
+            keyfile=keyfile,
+            transformed_key=transformed_key
+        )
 
-    def read(self, filename=None, password=None, keyfile=None):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, typ, value, tb):
+        # see issue 137
+        pass
+
+    def read(self, filename=None, password=None, keyfile=None,
+             transformed_key=None):
         self.password = password
         self.keyfile = keyfile
         if not filename:
             filename = self.filename
 
-        self.kdbx = KDBX.parse_file(
-            filename,
-            password=password,
-            keyfile=keyfile
-        )
+        try:
+            self.kdbx = KDBX.parse_file(
+                filename,
+                password=password,
+                keyfile=keyfile,
+                transformed_key=transformed_key
+            )
+        except ChecksumError:
+            raise CredentialsIntegrityError
 
-
-    def save(self, filename=None):
+    def save(self, filename=None, transformed_key=None):
         if not filename:
             filename = self.filename
 
@@ -49,7 +74,8 @@ class PyKeePass(object):
                 KDBX.build(
                     self.kdbx,
                     password=self.password,
-                    keyfile=self.keyfile
+                    keyfile=self.keyfile,
+                    transformed_key=transformed_key
                 )
             )
 
@@ -76,12 +102,16 @@ class PyKeePass(object):
                 return 'aeskdf'
 
     @property
+    def transformed_key(self):
+        return self.kdbx.body.transformed_key
+
+    @property
     def tree(self):
         return self.kdbx.body.payload.xml
 
     @property
     def root_group(self):
-        return self.find_groups_by_path('', group=None, first=True)
+        return self.find_groups(path='', first=True)
 
     @property
     def groups(self):
@@ -90,6 +120,14 @@ class PyKeePass(object):
     @property
     def entries(self):
         return self.find_entries_by_title('.*', regex=True)
+
+    def xml(self):
+        return etree.tostring(
+            self.tree,
+            pretty_print=True,
+            standalone=True,
+            encoding='unicode'
+        )
 
     def dump_xml(self, outfile):
         '''
@@ -106,140 +144,130 @@ class PyKeePass(object):
                 )
             )
 
-    def _xpath(self, xpath_str, tree=None):
+    def _xpath(self, xpath_str, tree=None, first=False, history=False,
+               cast=False, **kwargs):
+
         if tree is None:
             tree = self.tree
         logger.debug(xpath_str)
-        result = tree.xpath(
+        elements = tree.xpath(
             xpath_str, namespaces={'re': 'http://exslt.org/regular-expressions'}
         )
-        # Typed result array
+
         res = []
-        for r in result:
-            if r.tag == 'Entry':
-                res.append(Entry(element=r, version=self.version))
-            elif r.tag == 'Group':
-                res.append(Group(element=r, version=self.version))
-            else:
-                res.append(r)
-        return res
-
-
-    def _find(self, keys_xp, regex=False, flags=None, group=None,
-              history=False, first=False, **kwargs):
-
-        regex_string = '[re:test(text(), "{}", "{}")]'
-        match_string = '[text()="{}"]'
-
-        group_xp = '/Group/Name{}/..'
-        entry_xp = '/Entry/String/Key[text()="Title"]/../Value{}/../..'
-
-        xp = ''
-
-        # resolve path before handling any other keys
-        if 'path' in kwargs.keys():
-            xp += '/KeePassFile/Root/Group'
-            # split provided path into group and entry
-            group_path = os.path.dirname(kwargs['path']).lstrip('/')
-            entry = os.path.basename(kwargs['path'])
-            # build xpath from group_path and entry
-            if group_path:
-                for element in group_path.split('/'):
-                    if regex:
-                        xp += group_xp.format(regex_string).format(element, flags)
+        for e in elements:
+            if history or e.getparent().tag != 'History':
+                if cast:
+                    if e.tag == 'Entry':
+                        res.append(Entry(element=e, kp=self))
+                    elif e.tag == 'Group':
+                        res.append(Group(element=e, kp=self))
+                    elif e.tag == 'Binary' and e.getparent().tag == 'Entry':
+                        res.append(Attachment(element=e, kp=self))
                     else:
-                        xp += group_xp.format(match_string).format(element)
-            if entry:
-                if regex:
-                    xp += (entry_xp.format(regex_string)).format(entry, flags)
+                        raise Exception('Could not cast element {}'.format(e))
                 else:
-                    xp += (entry_xp.format(match_string)).format(entry)
+                    res.append(e)
 
-            kwargs.pop('path')
-        elif group is not None:
-            xp += '.'
-
-        if kwargs.keys():
-            xp += keys_xp['prefix']
-
-            # handle searching custom string fields
-            if 'string' in kwargs.keys():
-                for key, value in kwargs['string'].items():
-                    if regex:
-                        xp += (keys_xp['string'].format(key, regex_string)).format(value, flags)
-                    else:
-                        xp += (keys_xp['string'].format(key, match_string)).format(value, flags)
-
-                kwargs.pop('string')
-
-            # build xpath to filter results with specified attributes
-            for key, value in kwargs.items():
-                if key not in keys_xp.keys():
-                    raise TypeError('Invalid keyword argument "{}"'.format(key))
-
-                if regex:
-                    xp += (keys_xp[key].format(regex_string)).format(value, flags)
-                else:
-                    xp += (keys_xp[key].format(match_string)).format(value, flags)
-
-        res = self._xpath(xp, tree=group._element if group else None)
-
-        return res
-
-    #---------- Groups ----------
-
-    def find_groups(self, first=False, recursive=True, **kwargs):
-
-        keys_xp = {
-            'prefix': '//Group' if recursive else '/Group',
-            'name': '/Name{}/..',
-            'uuid': '/UUID{}/..',
-            'notes': '/Notes{}/..',
-        }
-
-        res = self._find(keys_xp, **kwargs)
         # return first object in list or None
         if first:
             res = res[0] if res else None
 
         return res
 
+    def _find(self, prefix, keys_xp, path=None, tree=None, first=False,
+              history=False, regex=False, flags=None, **kwargs):
 
-    def find_groups_by_path(self, group_path_str=None, regex=False, flags=None,
-                            group=None, first=False):
+        xp = ''
 
-        return self.find_groups(name=group_name,
-                                regex=regex,
-                                flags=flags,
-                                group=group,
-                                first=first
+        if path is not None:
+
+            first = True
+
+            xp += '/KeePassFile/Root/Group'
+            path = path.strip('/')
+            # split provided path into group and element
+            group_path = os.path.dirname(path)
+            element = os.path.basename(path)
+            # build xpath from group_path and element
+            if group_path:
+                for group in group_path.split('/'):
+                    xp += path_xp[regex]['group'].format(group, flags=flags)
+            if 'Entry' in prefix:
+                xp += path_xp[regex]['entry'].format(element, flags=flags)
+            elif element and 'Group' in prefix:
+                xp += path_xp[regex]['group'].format(element, flags=flags)
+
+        else:
+            if tree is not None:
+                xp += '.'
+
+            if kwargs.keys():
+                xp += prefix
+
+            # handle searching custom string fields
+            if 'string' in kwargs.keys():
+                for key, value in kwargs['string'].items():
+                    xp += keys_xp[regex]['string'].format(key, value, flags=flags)
+
+                kwargs.pop('string')
+
+            # convert uuid to base64 form before building xpath
+            if 'uuid' in kwargs.keys():
+                kwargs['uuid'] = base64.b64encode(kwargs['uuid'].bytes).decode('utf-8')
+
+            # convert tags to semicolon separated string before building xpath
+            if 'tags' in kwargs.keys():
+                kwargs['tags'] = ';'.join(kwargs['tags'])
+
+            # build xpath to filter results with specified attributes
+            for key, value in kwargs.items():
+                if key not in keys_xp[regex].keys():
+                    raise TypeError('Invalid keyword argument "{}"'.format(key))
+
+                xp += keys_xp[regex][key].format(value, flags=flags)
+
+        res = self._xpath(
+            xp,
+            tree=tree._element if tree else None,
+            first=first,
+            history=history,
+            cast=True,
+            **kwargs
         )
 
+        return res
+
+    # ---------- Groups ----------
+
+    def find_groups(self, recursive=True, path=None, group=None, **kwargs):
+
+        prefix = '//Group' if recursive else '/Group'
+        res = self._find(prefix, group_xp, path=path, tree=group, **kwargs)
+        return res
 
     def find_groups_by_name(self, group_name, regex=False, flags=None,
                             group=None, first=False):
-
-        return self.find_groups(name=group_name,
-                                regex=regex,
-                                flags=flags,
-                                group=group,
-                                first=first
+        return self.find_groups(
+            name=group_name,
+            regex=regex,
+            flags=flags,
+            group=group,
+            first=first
         )
-
 
     def find_groups_by_path(self, group_path_str=None, regex=False, flags=None,
                             group=None, first=False):
-
-        return self.find_groups(path=group_path_str,
-                                regex=regex,
-                                flags=flags,
-                                group=group,
-                                first=first
+        return self.find_groups(
+            path=group_path_str,
+            regex=regex,
+            flags=flags,
+            group=group,
+            first=first
         )
 
     def find_groups_by_uuid(self, uuid, regex=False, flags=None,
-                              group=None, history=False, first=False):
-
+                            group=None, history=False, first=False):
         return self.find_groups(
             uuid=uuid,
             regex=regex,
@@ -250,8 +278,7 @@ class PyKeePass(object):
         )
 
     def find_groups_by_notes(self, notes, regex=False, flags=None,
-                              group=None, history=False, first=False):
-
+                             group=None, history=False, first=False):
         return self.find_groups(
             notes=notes,
             regex=regex,
@@ -266,9 +293,9 @@ class PyKeePass(object):
         logger.debug('Creating group {}'.format(group_name))
 
         if icon:
-            group = Group(name=group_name, icon=icon, notes=notes, version=self.version)
+            group = Group(name=group_name, icon=icon, notes=notes, kp=self)
         else:
-            group = Group(name=group_name, notes=notes, version=self.version)
+            group = Group(name=group_name, notes=notes, kp=self)
         destination_group.append(group)
 
         return group
@@ -276,36 +303,40 @@ class PyKeePass(object):
     def delete_group(self, group):
         group.delete()
 
+    def deref(self, value):
+        if not value:
+            return value
+        references = set(re.findall(r'({REF:([TUPANI])@([TUPANI]):([^}]+)})', value))
+        if not references:
+            return value
+        field_to_attribute = {
+            'T': 'title',
+            'U': 'username',
+            'P': 'password',
+            'A': 'url',
+            'N': 'notes',
+            'I': 'uuid',
+        }
+        for ref, wanted_field, search_in, search_value in references:
+            wanted_field = field_to_attribute[wanted_field]
+            search_in = field_to_attribute[search_in]
+            if search_in == 'uuid':
+                search_value = uuid.UUID(search_value)
+            ref_entry = self.find_entries(first=True, **{search_in: search_value})
+            value = value.replace(ref, getattr(ref_entry, wanted_field))
+        return self.deref(value)
+
     def move_group(self, group, destination_group):
         destination_group.append(group)
 
-    #---------- Entries ----------
+    # ---------- Entries ----------
 
-    def find_entries(self, history=False, first=False, recursive=True, **kwargs):
+    def find_entries(self, recursive=True, path=None, group=None, **kwargs):
 
-        keys_xp = {
-            'prefix': '//Entry' if recursive else '/Entry',
-            'title': '/String/Key[text()="Title"]/../Value{}/../..',
-            'username': '/String/Key[text()="UserName"]/../Value{}/../..',
-            'password': '/String/Key[text()="Password"]/../Value{}/../..',
-            'url': '/String/Key[text()="URL"]/../Value{}/../..',
-            'notes': '/String/Key[text()="Notes"]/../Value{}/../..',
-            'uuid': '/UUID{}/..',
-            'string': '/String/Key[text()="{}"]/../Value{}/../..',
-        }
-
-
-        res = self._find(keys_xp, **kwargs)
-
-        if history is False:
-            res = [item for item in res if item._element.getparent().tag != 'History']
-
-        # return first object in list or None
-        if first:
-            res = res[0] if res else None
+        prefix = '//Entry' if recursive else '/Entry'
+        res = self._find(prefix, entry_xp, path=path, tree=group, **kwargs)
 
         return res
-
 
     def find_entries_by_title(self, title, regex=False, flags=None,
                               group=None, history=False, first=False):
@@ -340,7 +371,6 @@ class PyKeePass(object):
             first=first
         )
 
-
     def find_entries_by_url(self, url, regex=False, flags=None,
                             group=None, history=False, first=False):
         return self.find_entries(
@@ -351,7 +381,6 @@ class PyKeePass(object):
             history=history,
             first=first
         )
-
 
     def find_entries_by_notes(self, notes, regex=False, flags=None,
                               group=None, history=False, first=False):
@@ -364,7 +393,6 @@ class PyKeePass(object):
             first=first
         )
 
-
     def find_entries_by_path(self, path, regex=False, flags=None,
                              group=None, history=False, first=False):
         return self.find_entries(
@@ -376,9 +404,8 @@ class PyKeePass(object):
             first=first
         )
 
-
     def find_entries_by_uuid(self, uuid, regex=False, flags=None,
-                              group=None, history=False, first=False):
+                             group=None, history=False, first=False):
         return self.find_entries(
             uuid=uuid,
             regex=regex,
@@ -388,9 +415,8 @@ class PyKeePass(object):
             first=first
         )
 
-
     def find_entries_by_string(self, string, regex=False, flags=None,
-                              group=None, history=False, first=False):
+                               group=None, history=False, first=False):
         return self.find_entries(
             string=string,
             regex=regex,
@@ -399,7 +425,6 @@ class PyKeePass(object):
             history=history,
             first=first
         )
-
 
     def add_entry(self, destination_group, title, username,
                   password, url=None, notes=None, expiry_time=None,
@@ -431,15 +456,107 @@ class PyKeePass(object):
                 expires=True if expiry_time else False,
                 expiry_time=expiry_time,
                 icon=icon,
-                version=self.version
+                kp=self
             )
             destination_group.append(entry)
 
         return entry
-
 
     def delete_entry(self, entry):
         entry.delete()
 
     def move_entry(self, entry, destination_group):
         destination_group.append(entry)
+
+    # ---------- Attachments ----------
+
+    def find_attachments(self, recursive=True, path=None, element=None, **kwargs):
+
+        prefix = '//Binary' if recursive else '/Binary'
+        res = self._find(prefix, attachment_xp, path=path, tree=element, **kwargs)
+
+        return res
+
+    @property
+    def attachments(self):
+        return self.find_attachments(filename='.*', regex=True)
+
+    @property
+    def binaries(self):
+        if self.version >= (4, 0):
+            # first byte is a prepended flag
+            binaries = [a.data[1:] for a in self.kdbx.body.payload.inner_header.binary]
+        else:
+            binaries = []
+            for elem in self._xpath('/KeePassFile/Meta/Binaries/Binary'):
+                if elem.get('Compressed') == 'True':
+                    data = zlib.decompress(
+                        base64.b64decode(elem.text),
+                        zlib.MAX_WBITS | 32
+                    )
+                else:
+                    data = base64.b64decode(elem.text)
+                binaries.insert(int(elem.attrib['ID']), data)
+
+        return binaries
+
+    def add_binary(self, data, compressed=True, protected=True):
+        if self.version >= (4, 0):
+            # add protected flag byte
+            if protected:
+                data = b'\x01' + data
+            else:
+                data = b'\x00' + data
+            # add binary element to inner header
+            c = Container(type='binary', data=data)
+            self.kdbx.body.payload.inner_header.binary.append(c)
+        else:
+            binaries = self._xpath(
+                '/KeePassFile/Meta/Binaries',
+                first=True
+            )
+            if compressed:
+                # gzip compression
+                compressor = zlib.compressobj(
+                    zlib.Z_DEFAULT_COMPRESSION,
+                    zlib.DEFLATED,
+                    zlib.MAX_WBITS | 16
+                )
+                data = compressor.compress(data)
+                data += compressor.flush()
+            data = base64.b64encode(data).decode()
+
+            # set ID for Binary Element
+            binary_id = len(self.binaries)
+
+            # add binary element to XML
+            binaries.append(
+                E.Binary(data, ID=str(binary_id), Compressed=str(compressed))
+            )
+
+        # return binary id
+        return len(self.binaries) - 1
+
+    def delete_binary(self, id):
+        try:
+            if self.version >= (4, 0):
+                # remove binary element from inner header
+                self.kdbx.body.payload.inner_header.binary.pop(id)
+            else:
+                # remove binary element from XML
+                binaries = self._xpath('/KeePassFile/Meta/Binaries', first=True)
+                binaries.remove(binaries.getchildren()[id])
+        except IndexError:
+            raise BinaryError('No such binary with id {}'.format(id))
+
+        # remove all entry references to this attachment
+        for reference in self.find_attachments(id=id):
+            reference.delete()
+
+        # decrement references greater than this id
+        binaries_gt = self._xpath(
+            '//Binary/Value[@Ref > "{}"]/..'.format(id),
+            cast=True
+        )
+        for reference in binaries_gt:
+            reference.id = reference.id - 1

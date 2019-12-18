@@ -1,13 +1,18 @@
-from __future__ import unicode_literals
-from __future__ import absolute_import
-from pykeepass.baseelement import BaseElement
+# FIXME python2
+from __future__ import absolute_import, unicode_literals
+from future.utils import python_2_unicode_compatible
+
+import logging
 from copy import deepcopy
+from datetime import datetime
+
+from lxml.builder import E
 from lxml.etree import Element, _Element
 from lxml.objectify import ObjectifiedElement
-from lxml.builder import E
-import logging
+
+import pykeepass.attachment
 import pykeepass.group
-from datetime import datetime
+from pykeepass.baseelement import BaseElement
 
 logger = logging.getLogger(__name__)
 reserved_keys = [
@@ -18,29 +23,29 @@ reserved_keys = [
     'Tags',
     'IconID',
     'Times',
-    'History'
+    'History',
+    'Notes'
 ]
 
-
+# FIXME python2
+@python_2_unicode_compatible
 class Entry(BaseElement):
 
     def __init__(self, title=None, username=None, password=None, url=None,
                  notes=None, tags=None, expires=False, expiry_time=None,
-                 icon=None, element=None, version=None):
+                 icon=None, autotype_sequence=None, autotype_enabled=True,
+                 element=None, kp=None):
 
-        assert type(version) is tuple, 'The provided version is not a tuple, but a {}'.format(
-            type(version)
-        )
-
-        super(Entry, self).__init__(
-            element=element,
-            version=version,
-            expires=expires,
-            expiry_time=expiry_time,
-            icon=icon
-        )
+        self._kp = kp
 
         if element is None:
+            super(Entry, self).__init__(
+                element=Element('Entry'),
+                kp=kp,
+                expires=expires,
+                expiry_time=expiry_time,
+                icon=icon
+            )
             self._element.append(E.String(E.Key('Title'), E.Value(title)))
             self._element.append(E.String(E.Key('UserName'), E.Value(username)))
             self._element.append(
@@ -54,6 +59,13 @@ class Entry(BaseElement):
                 self._element.append(
                     E.Tags(';'.join(tags) if type(tags) is list else tags)
                 )
+            self._element.append(
+                E.AutoType(
+                    E.Enabled(str(autotype_enabled)),
+                    E.DataTransferObfuscation('0'),
+                    E.DefaultSequence(str(autotype_sequence))
+                )
+            )
 
         else:
             assert type(element) in [_Element, Element, ObjectifiedElement], \
@@ -62,19 +74,17 @@ class Entry(BaseElement):
                 )
             assert element.tag == 'Entry', 'The provided element is not an Entry '\
                 'element, but a {}'.format(element.tag)
+            self._element = element
 
     def _get_string_field(self, key):
-        results = self._element.xpath('String/Key[text()="{}"]/../Value'.format(key))
-        if results:
-            return results[0].text
+        field = self._xpath('String/Key[text()="{}"]/../Value'.format(key), first=True)
+        if field is not None:
+            return field.text
 
     def _set_string_field(self, key, value):
-        results = self._element.xpath('String/Key[text()="{}"]/..'.format(key))
-        if results:
-            logger.debug('There is field named {}. Remove it and create again.'.format(key))
-            self._element.remove(results[0])
-        else:
-            logger.debug('No field named {}. Create it.'.format(key))
+        field = self._xpath('String/Key[text()="{}"]/..'.format(key), first=True)
+        if field is not None:
+            self._element.remove(field)
         self._element.append(E.String(E.Key(key), E.Value(value)))
 
     def _get_string_field_keys(self, exclude_reserved=False):
@@ -83,6 +93,30 @@ class Entry(BaseElement):
             return [x for x in results if x not in reserved_keys]
         else:
             return results
+
+    @property
+    def attachments(self):
+        return self._kp.find_attachments(
+            element=self,
+            filename='.*',
+            regex=True,
+            recursive=False
+        )
+
+    def add_attachment(self, id, filename):
+        element = E.Binary(
+            E.Key(filename),
+            E.Value(Ref=str(id))
+        )
+        self._element.append(element)
+
+        return pykeepass.attachment.Attachment(element=element, kp=self._kp)
+
+    def delete_attachment(self, attachment):
+        attachment.delete()
+
+    def deref(self, attribute):
+        return self._kp.deref(getattr(self, attribute))
 
     @property
     def title(self):
@@ -134,7 +168,7 @@ class Entry(BaseElement):
 
     @property
     def tags(self):
-        val =  self._get_subelement_text('Tags')
+        val = self._get_subelement_text('Tags')
         return val.split(';') if val else val
 
     @tags.setter
@@ -146,11 +180,36 @@ class Entry(BaseElement):
     @property
     def history(self):
         if self._element.find('History') is not None:
-            return [Entry(element=x, version=self._version) for x in self._element.find('History').findall('Entry')]
+            return [Entry(element=x, kp=self._kp) for x in self._element.find('History').findall('Entry')]
+        else:
+            return []
 
     @history.setter
     def history(self, value):
         raise NotImplementedError()
+
+    @property
+    def autotype_enabled(self):
+        enabled = self._element.find('AutoType/Enabled')
+        if enabled.text is not None:
+            return enabled.text == 'True'
+
+    @autotype_enabled.setter
+    def autotype_enabled(self, value):
+        enabled = self._element.find('AutoType/Enabled')
+        if value is not None:
+            enabled.text = str(value)
+        else:
+            enabled.text = None
+
+    @property
+    def autotype_sequence(self):
+        sequence = self._element.find('AutoType/DefaultSequence')
+        return sequence.text if sequence is not None else None
+
+    @autotype_sequence.setter
+    def autotype_sequence(self, value):
+        self._element.find('AutoType/DefaultSequence').text = value
 
     @property
     def is_a_history_entry(self):
@@ -160,21 +219,12 @@ class Entry(BaseElement):
         return False
 
     @property
-    def parentgroup(self):
-        if self.is_a_history_entry:
-            ancestor = self._element.getparent().getparent()
-        else:
-            ancestor = self._element.getparent()
-        if ancestor is not None:
-            return pykeepass.group.Group(element=ancestor, version=self._version)
-
-    @property
     def path(self):
         # The root group is an orphan
         if self.is_a_history_entry:
             pentry = Entry(
                 element=self._element.getparent().getparent(),
-                version=self._version
+                kp=self._kp
             ).title
             return '[History of: {}]'.format(pentry)
         if self.parentgroup is None:
@@ -182,7 +232,7 @@ class Entry(BaseElement):
         p = self.parentgroup
         ppath = ''
         while p is not None and not p.is_root_group:
-            if p.name is not None: # dont make the root group appear
+            if p.name is not None:  # dont make the root group appear
                 ppath = '{}/{}'.format(p.name, ppath)
             p = p.parentgroup
         return '{}{}'.format(ppath, self.title)
@@ -198,10 +248,10 @@ class Entry(BaseElement):
     def delete_custom_property(self, key):
         if key not in self._get_string_field_keys(exclude_reserved=True):
             raise AttributeError('No such key: {}'.format(key))
-        prop = self._element.xpath('String/Key[text()="{}"]/..'.format(key))
-        if len(prop) < 1:
+        prop = self._xpath('String/Key[text()="{}"]/..'.format(key), first=True)
+        if prop is None:
             raise AttributeError('Could not find property element')
-        self._element.remove(prop[0])
+        self._element.remove(prop)
 
     @property
     def custom_properties(self):
@@ -211,38 +261,40 @@ class Entry(BaseElement):
             props[k] = self._get_string_field(k)
         return props
 
+    def ref(self, attribute):
+        """Create reference to an attribute of this element."""
+        attribute_to_field = {
+            'title': 'T',
+            'username': 'U',
+            'password': 'P',
+            'url': 'A',
+            'notes': 'N',
+            'uuid': 'I',
+        }
+        return '{{REF:{}@I:{}}}'.format(attribute_to_field[attribute], self.uuid.hex.upper())
+
     def touch(self, modify=False):
         '''
         Update last access time of an entry
         '''
-        self._element.Times.LastAccessTime = datetime.utcnow()
+        now = datetime.now()
+        self.atime = now
         if modify:
-            self._element.Times.LastModificationTime = datetime.utcnow()
+            self.mtime = now
 
     def save_history(self):
         '''
         Save the entry in its history
         '''
         archive = deepcopy(self._element)
-        if self._element.find('History') is not None:
-            archive.remove(archive.History)
-            self._element.History.append(archive)
+        hist = archive.find('History')
+        if hist is not None:
+            archive.remove(hist)
+            self._element.find('History').append(archive)
         else:
             history = Element('History')
             history.append(archive)
             self._element.append(history)
 
     def __str__(self):
-        return str(
-            'Entry: "{} ({})"'.format(self.path, self.username).encode('utf-8')
-        )
-
-    def __eq__(self, other):
-        return (
-            (self.title, self.username, self.password, self.url,
-             self.notes, self.icon, self.tags, self.atime, self.ctime,
-             self.mtime, self.expires, self.uuid) ==
-            (other.title, other.username, other.password, other.url,
-             other.notes, other.icon, other.tags, other.atime, other.ctime,
-             other.mtime, other.expires, other.uuid)
-        )
+        return 'Entry: "{} ({})"'.format(self.path, self.username)

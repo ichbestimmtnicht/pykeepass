@@ -1,9 +1,21 @@
 pykeepass
 ============
 
-This library allows you to write entries to a KeePass database
+.. image:: https://travis-ci.org/libkeepass/pykeepass.svg?branch=master
+   :target: https://travis-ci.org/libkeepass/pykeepass
 
-Simple Example
+.. image:: https://img.shields.io/matrix/pykeepass:matrix.org.svg
+   :target: https://matrix.to/#/#pykeepass:matrix.org
+
+    
+This library allows you to write entries to a KeePass database.
+
+Come chat at `#pykeepass`_ on Freenode or `#pykeepass:matrix.org`_ on Matrix.
+
+.. _#pykeepass: irc://irc.freenode.net
+.. _#pykeepass\:matrix.org: https://matrix.to/#/%23pykeepass:matrix.org 
+
+Example
 --------------
 .. code:: python
 
@@ -45,12 +57,12 @@ Finding Entries
 
 **find_entries** (title=None, username=None, password=None, url=None, notes=None, path=None, uuid=None, string=none, group=None, recursive=True, regex=False, flags=None, history=False, first=False)
 
-Returns entries which match all provided parameters, where ``title``, ``username``, ``password``, ``url``, ``notes``, ``path`` and ``uuid`` are strings, ``string`` is a dict.  This function has optional ``regex`` boolean and ``flags`` string arguments, which means to interpret search strings as `XSLT style`_ regular expressions with `flags`_.
+Returns entries which match all provided parameters, where ``title``, ``username``, ``password``, ``url``, ``notes``, ``path``, and ``autotype_sequence`` are strings, ``string`` is a dict, ``autotype_enabled`` is a boolean, ``uuid`` is a ``uuid.UUID``.  This function has optional ``regex`` boolean and ``flags`` string arguments, which means to interpret search strings as `XSLT style`_ regular expressions with `flags`_.
 
 .. _XSLT style: https://www.xml.com/pub/a/2003/06/04/tr.html
 .. _flags: https://www.w3.org/TR/xpath-functions/#flags 
 
-The ``path`` string can be a direct path to an entry, or (when ending in ``/``) the path to the group to recursively search under.
+The ``path`` string is a full path to an entry (ex. ``'foobar_group/foobar_entry'``).  This implies ``first=True``.  All other arguments are ignored when this is given.  This is useful for handling user input.
 
 The ``string`` dict allows for searching custom string fields.  ex. ``{'custom_field1': 'custom value', 'custom_field2': 'custom value'}``
 
@@ -88,35 +100,18 @@ a flattened list of all entries in the database
    >>> kp.find_entries(title='facebook', group=group, recursive=False, first=True)
    Entry: "social/facebook (myusername)"
 
-For backwards compatibility, the following function are also available:
-
-**find_entries_by_title** (title, regex=False, flags=None, tree=None, history=False, first=False)
-
-**find_entries_by_username** (username, regex=False, flags=None, tree=None, history=False, first=False)
-
-**find_entries_by_password** (password, regex=False, flags=None, tree=None, history=False, first=False)
-
-**find_entries_by_url** (url, regex=False, flags=None, tree=None, history=False, first=False)
-
-**find_entries_by_notes** (notes, regex=False, flags=None, tree=None, history=False, first=False)
-
-**find_entries_by_path** (path, regex=False, flags=None, tree=None, history=False, first=False)
-
-**find_entries_by_uuid** (uuid, regex=False, flags=None, tree=None, history=False, first=False)
-
-**find_entries_by_string** (string, regex=False, flags=None, tree=None, history=False, first=False)
 
 Finding Groups
 ----------------------
 
 **find_groups** (name=None, path=None, uuid=None, notes=None, group=None, recursive=True, regex=False, flags=None, first=False)
 
-where ``name``, ``path``, ``uuid`` and ``notes`` are strings.  This function has optional ``regex`` boolean and ``flags`` string arguments, which means to interpret search strings as `XSLT style`_ regular expressions with `flags`_.
+where ``name``, ``path``, and ``notes`` are strings, ``uuid`` is a ``uuid.UUID``. This function has optional ``regex`` boolean and ``flags`` string arguments, which means to interpret search strings as `XSLT style`_ regular expressions with `flags`_.
 
 .. _XSLT style: https://www.xml.com/pub/a/2003/06/04/tr.html
 .. _flags: https://www.w3.org/TR/xpath-functions/#flags 
 
-The ``path`` string must end in ``/``.
+The ``path`` string is a full path to a group (ex. ``'foobar_group/sub_group'``).  This implies ``first=True``.  All other arguments are ignored when this is given.  This is useful for handling user input.
 
 The ``group`` argument determines what ``Group`` to search under, and the ``recursive`` boolean controls whether to search recursively.
 
@@ -152,16 +147,6 @@ a flattened list of all groups in the database
 
    >>> kp.root_group
    Group: "/"
-
-For backwards compatibility, the following functions are also available:
-
-**find_groups_by_name** (name, tree=None, regex=False, flags=None, first=False)
-
-**find_groups_by_path** (path, tree=None, regex=False, flags=None, first=False)
-
-**find_groups_by_uuid** (uuid, tree=None, regex=False, flags=None, first=False)
-
-**find_groups_by_notes** (notes, tree=None, regex=False, flags=None, first=False)
 
 
 Adding Entries
@@ -230,11 +215,108 @@ Adding Groups
    # save the database
    >>> kp.save()
 
+Attachments
+-----------
+
+In this section, *binary* refers to the bytes of the attached data (stored at the root level of the database), while *attachment* is a reference to a binary (stored in an entry).  A binary can have none, one or many attachments.
+
+**add_binary** (data, compressed=True, protected=True)
+
+where ``data`` is bytes.  Adds a blob of data to the database. The attachment reference must still be added to an entry (see below).  ``compressed`` only applies to KDBX3 and ``protected`` only applies to KDBX4.  Returns id of attachment.
+
+**delete_binary** (id)
+
+where ``id`` is an int.  Removes binary data from the database and deletes any attachments that reference it.  Since attachments reference binaries by their positional index, attachments that reference binaries id > ``id`` will automatically be decremented.
+
+**find_attachments** (id=None, filename=None, element=None, recursive=True, regex=False, flags=None, history=False, first=False)
+
+where ``id`` is an int, ``filename`` is a string, and element is an ``Entry`` or ``Group`` to search under.
+
+* if ``first=False``, the function returns a list of ``Attachment`` s or ``[]`` if there are no matches
+* if ``first=True``, the function returns the first ``Attachment`` match, or ``None`` if there are no matches
+
+**binaries**
+
+list of bytes containing binary data.  List index corresponds to attachment id.
+
+**attachments**
+
+list containing all ``Attachment`` s in the database.
+
+**Entry.add_attachment** (id, filename)
+
+where ``id`` is an int and ``filename`` is a string.  Creates a reference using the given filename to a database binary.  The existence of an binary with the given id is not checked.  Returns ``Attachment``.
+
+**Entry.delete_attachment** (attachment)
+
+where ``attachment`` is an ``Attachment``.  Deletes a reference to a database binary.
+
+**Entry.attachments**
+
+list of ``Attachment`` s for this Entry.
+
+**Attachment.id**
+
+id of data that this attachment points to
+
+**Attachment.filename**
+
+string representing this attachment
+
+**Attachment.data**
+
+the data that this attachment points to.  Raises ``BinaryError`` if data does not exist.
+
+**Attachment.entry**
+
+the entry that this attachment is attached to
+
+.. code:: python
+
+   >>> e = kp.add_entry(kp.root_group, title='foo', username='', password='')
+
+   # add attachment data to the db
+   >>> binary_id = kp.add_binary(b'Hello world')
+
+   >>> kp.binaries
+   [b'Hello world']
+
+   # add attachment reference to entry
+   >>> a = e.add_attachment(binary_id, 'hello.txt')
+   >>> a
+   Attachment: 'hello.txt' -> 0
+     
+   # access attachments
+   >>> a
+   Attachment: 'hello.txt' -> 0
+   >>> a.id
+   0
+   >>> a.filename
+   'hello.txt'
+   >>> a.data
+   b'Hello world'
+   >>> e.attachments
+   [Attachment: 'hello.txt' -> 0]
+
+   # list all attachments in the database
+   >>> kp.attachments
+   [Attachment: 'hello.txt' -> 0]
+
+   # search attachments
+   >>> kp.find_attachments(filename='hello.txt')
+   [Attachment: 'hello.txt' -> 0]
+
+   # delete attachment reference
+   >>> e.delete_attachment(a)
+
+   # or, delete both attachment reference and binary
+   >>> kp.delete_binary(binary_id)
+
 Miscellaneous
 -------------
-**read** (filename, password=None, keyfile=None)
+**read** (filename, password=None, keyfile=None, transformed_key=None)
 
-where ``filename``, ``password``, and ``keyfile`` are strings.  ``filename`` is the path to the database, ``password`` is the master password string, and ``keyfile`` is the path to the database keyfile.  At least one of ``password`` and ``keyfile`` is required.
+where ``filename``, ``password``, and ``keyfile`` are strings.  ``filename`` is the path to the database, ``password`` is the master password string, and ``keyfile`` is the path to the database keyfile.  At least one of ``password`` and ``keyfile`` is required.  Alternatively, the derived key can be supplied directly through ``transformed_key``.
 
 **save** (filename=None)
 

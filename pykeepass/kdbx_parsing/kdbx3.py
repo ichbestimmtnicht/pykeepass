@@ -11,19 +11,35 @@ from construct import (
 from .common import (
     aes_kdf, AES256Payload, ChaCha20Payload, TwoFishPayload, Concatenated,
     DynamicDict, compute_key_composite, Decompressed, Reparsed,
-    compute_master, CompressionFlags, CredentialsError, PayloadChecksumError,
-    XML, CipherId, ProtectedStreamId, Unprotect
+    compute_master, CompressionFlags, XML, CipherId, ProtectedStreamId, Unprotect
 )
 
 
 # -------------------- Key Derivation --------------------
 
-# https://github.com/keepassxreboot/keepassxc/blob/8324d03f0a015e62b6182843b4478226a5197090/src/format/KeePass2.cpp#L24-L26 
+# https://github.com/keepassxreboot/keepassxc/blob/8324d03f0a015e62b6182843b4478226a5197090/src/format/KeePass2.cpp#L24-L26
 kdf_uuids = {
     'aes': b'\xc9\xd9\xf3\x9ab\x8aD`\xbft\r\x08\xc1\x8aO\xea',
-    'twofish': b'\xadh\xf2\x9fWoK\xb9\xa3j\xd4z\xf9e4l',
-    'chacha20': b'\xd6\x03\x8a+\x8boL\xb5\xa5$3\x9a1\xdb\xb5\x9a'
 }
+
+
+def compute_transformed(context):
+    """Compute transformed key for opening database"""
+
+    if context._._.transformed_key is not None:
+        transformed_key = context._._.transformed_key
+    else:
+        key_composite = compute_key_composite(
+            password=context._._.password,
+            keyfile=context._._.keyfile
+        )
+        transformed_key = aes_kdf(
+            context._.header.value.dynamic_header.transform_seed.data,
+            context._.header.value.dynamic_header.transform_rounds.data,
+            key_composite
+        )
+
+    return transformed_key
 
 
 # -------------------- Dynamic Header --------------------
@@ -43,7 +59,7 @@ DynamicHeaderItem = Struct(
          'protected_stream_key': 8,
          'stream_start_bytes': 9,
          'protected_stream_id': 10,
-        }
+         }
     ),
     "data" / Prefixed(
         Int16ul,
@@ -53,7 +69,7 @@ DynamicHeaderItem = Struct(
              'cipher_id': CipherId,
              'transform_rounds': Int32ul,
              'protected_stream_id': ProtectedStreamId
-            },
+             },
             default=GreedyBytes
         )
     ),
@@ -101,7 +117,7 @@ PayloadBlock = Struct(
 )
 
 PayloadBlocks = RepeatUntil(
-    lambda item, a, b: len(item.block_data) == 0, # and item.block_hash == b'\x00' * 32,
+    lambda item, a, b: len(item.block_data) == 0,  # and item.block_hash == b'\x00' * 32,
     PayloadBlock
 )
 
@@ -137,22 +153,15 @@ UnpackedPayload = Reparsed(
 # -------------------- Main KDBX Structure --------------------
 
 Body = Struct(
-    "transformed_key" / Computed(
-        lambda this: aes_kdf(
-            this._.header.value.dynamic_header.transform_seed.data,
-            this._.header.value.dynamic_header.transform_rounds.data,
-            password=this._._.password,
-            keyfile=this._._.keyfile
-        )
-    ),
-    "master_key" / Computed(lambda cont: compute_master(cont)),
+    "transformed_key" / Computed(compute_transformed),
+    "master_key" / Computed(compute_master),
     "payload" / UnpackedPayload(
         Switch(
             this._.header.value.dynamic_header.cipher_id.data,
             {'aes256': AES256Payload(GreedyBytes),
              'chacha20': ChaCha20Payload(GreedyBytes),
              'twofish': TwoFishPayload(GreedyBytes),
-            }
+             }
         )
     ),
 )

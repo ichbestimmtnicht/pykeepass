@@ -1,51 +1,48 @@
-from __future__ import unicode_literals
 from __future__ import absolute_import
-from lxml import etree
-from lxml.etree import Element
-from lxml.builder import E
-from datetime import datetime, timedelta
+
 import base64
-from dateutil import parser, tz
-import uuid
 import struct
+import uuid
+from binascii import Error as BinasciiError
+from datetime import datetime, timedelta
+
+from dateutil import parser, tz
+from lxml import etree
+from lxml.builder import E
 
 
 class BaseElement(object):
     """Entry and Group inherit from this class"""
 
-    def __init__(self, element=None, version=None, icon=None, expires=False,
+    def __init__(self, element=None, kp=None, icon=None, expires=False,
                  expiry_time=None):
 
-        self._version = version
-        if element is None:
-            self._element = Element('Entry')
-            self._element.append(
-                E.UUID(base64.b64encode(uuid.uuid1().bytes).decode('utf-8'))
-            )
-            if icon:
-                self._element.append(E.IconID(icon))
-            current_time_str = self._encode_time(datetime.utcnow())
-            if expiry_time:
-                expiry_time_str = self._encode_time(
-                    self._datetime_to_utc(expiry_time)
-                )
-            else:
-                expiry_time_str = self._encode_time(datetime.utcnow())
-
-            self._element.append(
-                E.Times(
-                    E.CreationTime(current_time_str),
-                    E.LastModificationTime(current_time_str),
-                    E.LastAccessTime(current_time_str),
-                    E.ExpiryTime(expiry_time_str),
-                    E.Expires(str(expires if expires is not None else False)),
-                    E.UsageCount(str(0)),
-                    E.LocationChanged(current_time_str)
-                )
-            )
+        self._element = element
+        self._element.append(
+            E.UUID(base64.b64encode(uuid.uuid1().bytes).decode('utf-8'))
+        )
+        if icon:
+            self._element.append(E.IconID(icon))
+        current_time_str = self._encode_time(datetime.now())
+        if expiry_time:
+            expiry_time_str = self._encode_time(expiry_time)
         else:
-            self._element = element
+            expiry_time_str = current_time_str
 
+        self._element.append(
+            E.Times(
+                E.CreationTime(current_time_str),
+                E.LastModificationTime(current_time_str),
+                E.LastAccessTime(current_time_str),
+                E.ExpiryTime(expiry_time_str),
+                E.Expires(str(expires if expires is not None else False)),
+                E.UsageCount(str(0)),
+                E.LocationChanged(current_time_str)
+            )
+        )
+
+    def _xpath(self, xpath, **kwargs):
+        return self._kp._xpath(xpath, tree=self._element, **kwargs)
 
     def _get_subelement_text(self, tag):
         v = self._element.find(tag)
@@ -58,16 +55,30 @@ class BaseElement(object):
             self._element.remove(v)
         self._element.append(getattr(E, tag)(value))
 
+    @property
+    def group(self):
+        return self._xpath(
+            '(ancestor::Group)[last()]',
+            first=True,
+            cast=True
+        )
+
+    parentgroup = group
+
     def dump_xml(self, pretty_print=False):
         return etree.tostring(self._element, pretty_print=pretty_print)
 
     @property
     def uuid(self):
-        return self._get_subelement_text('UUID')
+        """Returns uuid of this element as a uuid.UUID object"""
+        b64_uuid = self._get_subelement_text('UUID')
+        return uuid.UUID(bytes=base64.b64decode(b64_uuid))
 
     @uuid.setter
-    def uuid(self, value):
-        return self._set_subelement_text('UUID', value)
+    def uuid(self, uuid):
+        """Set element uuid. `uuid` is a uuid.UUID object"""
+        b64_uuid = base64.b64encode(uuid.bytes).decode('utf-8')
+        return self._set_subelement_text('UUID', b64_uuid)
 
     @property
     def icon(self):
@@ -83,7 +94,7 @@ class BaseElement(object):
 
     def _datetime_to_utc(self, dt):
         """Convert naive datetimes to UTC"""
-        
+
         if not dt.tzinfo:
             dt = dt.replace(tzinfo=tz.gettz())
         return dt.astimezone(tz.gettz('UTC'))
@@ -91,9 +102,17 @@ class BaseElement(object):
     def _encode_time(self, value):
         """Convert datetime to base64 or plaintext string"""
 
-        if self._version >= (4, 0):
+        if self._kp.version >= (4, 0):
             diff_seconds = int(
-                (value - datetime(year=1, month=1, day=1)).total_seconds()
+                (
+                    self._datetime_to_utc(value) -
+                    datetime(
+                        year=1,
+                        month=1,
+                        day=1,
+                        tzinfo=tz.gettz('UTC')
+                    )
+                ).total_seconds()
             )
             return base64.b64encode(
                 struct.pack('<Q', diff_seconds)
@@ -104,28 +123,25 @@ class BaseElement(object):
     def _decode_time(self, text):
         """Convert base64 time or plaintext time to datetime"""
 
-        if self._version >= (4, 0):
+        if self._kp.version >= (4, 0):
             # decode KDBX4 date from b64 format
             try:
                 return (
-                    datetime(year=1, month=1, day=1) +
+                    datetime(year=1, month=1, day=1, tzinfo=tz.gettz('UTC')) +
                     timedelta(
-                        seconds=int.from_bytes(
-                            base64.b64decode(text), 'little'
-                        )
+                        seconds=struct.unpack('<Q', base64.b64decode(text))[0]
                     )
                 )
             except BinasciiError:
                 return parser.parse(
                     text,
-                    tzinfos={'UTC':tz.gettz('UTC')}
+                    tzinfos={'UTC': tz.gettz('UTC')}
                 )
         else:
             return parser.parse(
                 text,
-                tzinfos={'UTC':tz.gettz('UTC')}
+                tzinfos={'UTC': tz.gettz('UTC')}
             )
-
 
     def _get_times_property(self, prop):
         times = self._element.find('Times')
@@ -155,8 +171,9 @@ class BaseElement(object):
 
     @property
     def expired(self):
-        return self.expires and (datetime.utcnow() > self.expiry_time)
-
+        if self.expires:
+            return self._datetime_to_utc(datetime.utcnow()) > self._datetime_to_utc(self.expiry_time)
+        return False
 
     @property
     def expiry_time(self):
@@ -198,3 +215,9 @@ class BaseElement(object):
 
     def __repr__(self):
         return self.__str__()
+
+    def __eq__(self, other):
+        if hasattr(other, 'uuid'):
+            return self.uuid == other.uuid
+        else:
+            return False
